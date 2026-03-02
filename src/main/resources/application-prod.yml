@@ -5,10 +5,18 @@ spring:
     username: ${DB_USERNAME:oms}
     password: ${DB_PASSWORD:oms}
   jpa:
-    database-platform: org.hibernate.dialect.PostgreSQLDialect
     hibernate:
       ddl-auto: validate
     show-sql: false
-  h2:
-    console:
-      enabled: false
+  data:
+    mongodb:
+      uri: mongodb://${MONGO_HOST:localhost}:${MONGO_PORT:27017}/oms_events
+
+oms:
+  routing:
+    enabled: true
+  datasource:
+    primary:
+      url: jdbc:postgresql://localhost:5432/omsdb
+    replica:
+      url: jdbc:postgresql://localhost:5433/omsdb

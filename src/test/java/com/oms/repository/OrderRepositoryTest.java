@@ -8,11 +8,17 @@ import com.oms.entity.Product;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.jpa.domain.Specification;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -20,14 +26,17 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Integration test for the OrderRepository using an in-memory H2 database.
+ * Integration test for the OrderRepository using Testcontainers PostgreSQL.
  *
  * @DataJpaTest configures a minimal Spring context with only JPA-related beans:
- *  - Auto-configures an embedded H2 database (replaces any real datasource)
- *  - Scans and registers @Entity classes, creates the schema (ddl-auto=create-drop)
+ *  - Scans and registers @Entity classes
+ *  - Flyway runs migrations against the Testcontainers PostgreSQL instance
  *  - Provides a TestEntityManager for bypassing the repository when arranging test data
  *  - Wraps each test in a transaction that rolls back after the test (clean slate per test)
  *  - Does NOT load @Service, @Controller, or other non-JPA beans
+ *
+ * @AutoConfigureTestDatabase(replace = NONE) prevents Spring from replacing the datasource
+ * with an embedded database — we want the Testcontainers PostgreSQL instead.
  *
  * We test four types of repository queries:
  *  1. Derived queries  — Spring Data generates SQL from the method name (findByStatus, findByCustomerId)
@@ -36,7 +45,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  *  4. Specifications    — dynamic, composable WHERE-clause filters (OrderSpecification)
  */
 @DataJpaTest
+@Testcontainers
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 class OrderRepositoryTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
+
+    @DynamicPropertySource
+    static void configureProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+    }
 
     /**
      * TestEntityManager is provided by @DataJpaTest. It wraps the JPA EntityManager

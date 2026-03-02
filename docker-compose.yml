@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: oms-postgres
+    environment:
+      POSTGRES_DB: omsdb
+      POSTGRES_USER: oms
+      POSTGRES_PASSWORD: oms
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  postgres-replica:
+    image: postgres:16
+    container_name: oms-postgres-replica
+    environment:
+      POSTGRES_DB: omsdb
+      POSTGRES_USER: oms
+      POSTGRES_PASSWORD: oms
+    ports:
+      - "5433:5432"
+
+  mongodb:
+    image: mongo:7
+    container_name: oms-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+
+volumes:
+  pgdata:
+  mongodata:

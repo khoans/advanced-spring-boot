@@ -13,7 +13,7 @@
 ### 1.1 Project Bootstrap
 
 - Initialize a Spring Boot 3.x project (Spring Initializr or manually).
-- Dependencies: `spring-boot-starter-web`, `spring-boot-starter-data-jpa`, `spring-boot-starter-validation`, `h2` (dev), `postgresql` (prod), `lombok`, `mapstruct`.
+- Dependencies: `spring-boot-starter-web`, `spring-boot-starter-data-jpa`, `spring-boot-starter-validation`, `postgresql` (via Docker Compose), `lombok`, `mapstruct`.
 - Configure multi-profile setup: `application.yml`, `application-dev.yml`, `application-prod.yml`.
 - Use `@ConfigurationProperties` with a custom prefix (e.g., `oms.order.*`) to bind typed configuration.
 
@@ -46,135 +46,142 @@
 
 ---
 
-## Phase 2 — Multiple Data Sources (Intermediate-Advanced)
+## Phase 2 — Multiple Data Sources: JPA + MongoDB (Intermediate-Advanced)
 
-**Goal:** Configure the OMS to connect to multiple databases simultaneously — a real-world requirement when your app needs to read/write from different systems (e.g., order DB, reporting DB, legacy system).
+**Goal:** Configure the OMS to connect to multiple databases simultaneously — JPA (PostgreSQL) for relational data and MongoDB for document data. Learn multi-datasource configuration, cross-database coordination, compensating transactions, read/write routing, and schema migrations.
 
 ### 2.1 Business Scenario
 
-The OMS now needs to work with **three data sources**:
+The OMS now needs to work with **two data source types**:
 
 | Data Source | Database | Purpose |
 |-------------|----------|---------|
-| **Primary (orders)** | PostgreSQL | Main OLTP database — orders, customers, products |
-| **Reporting (read-only)** | PostgreSQL (separate instance) | Pre-aggregated analytics — sales reports, dashboards |
-| **Legacy inventory** | MySQL | Legacy system that still manages warehouse stock levels |
+| **Primary (orders)** | PostgreSQL (via Docker) | Main OLTP database — orders, customers, products (existing) |
+| **Event Store** | MongoDB | Append-only order event/audit log — tracks every order lifecycle change |
 
-This mirrors real projects where you inherit legacy systems or separate read/write concerns.
+This mirrors real projects where different data models justify different storage engines: relational for transactional CRUD, document store for flexible event streams.
 
-### 2.2 Manual Multi-DataSource Configuration
+**Why MongoDB for events?**
+- Events are **append-only and immutable** — high-throughput inserts without relational constraints.
+- Each event type has **different payload fields** — flexible schema without catch-all JSON columns or multiple tables.
+- Events embed **denormalized snapshots** of order state — natural document model.
+- No disruption to existing JPA entities — purely additive.
 
-Spring Boot auto-configures a single `DataSource`. With multiple, you must configure them manually.
-
-#### Step 1: Define properties per data source
-
-```yaml
-# application.yml
-spring:
-  datasource:
-    primary:
-      url: jdbc:postgresql://localhost:5432/oms_orders
-      username: oms
-      password: secret
-      driver-class-name: org.postgresql.Driver
-    reporting:
-      url: jdbc:postgresql://localhost:5433/oms_reporting
-      username: oms_readonly
-      password: secret
-      driver-class-name: org.postgresql.Driver
-    legacy:
-      url: jdbc:mysql://localhost:3306/warehouse
-      username: legacy
-      password: secret
-      driver-class-name: com.mysql.cj.jdbc.Driver
-```
-
-#### Step 2: Create a `@Configuration` class per data source
-
-- Each config class defines its own `DataSource`, `EntityManagerFactory`, and `TransactionManager` beans.
-- Use `@Primary` on the main data source so Spring Boot defaults still work.
-- Use `@Qualifier` to inject the correct one by name.
-- Scope each `EntityManagerFactory` to its own **package** with `@EnableJpaRepositories(basePackages = ...)`.
+### 2.2 MongoDB Document Model
 
 ```java
-@Configuration
-@EnableJpaRepositories(
-    basePackages = "com.oms.order.repository",
-    entityManagerFactoryRef = "primaryEntityManagerFactory",
-    transactionManagerRef = "primaryTransactionManager"
-)
-public class PrimaryDataSourceConfig {
-
-    @Primary
-    @Bean
-    @ConfigurationProperties("spring.datasource.primary")
-    public DataSource primaryDataSource() {
-        return DataSourceBuilder.create().build();
-    }
-
-    @Primary
-    @Bean
-    public LocalContainerEntityManagerFactoryBean primaryEntityManagerFactory(
-            EntityManagerFactoryBuilder builder,
-            @Qualifier("primaryDataSource") DataSource ds) {
-        return builder.dataSource(ds)
-            .packages("com.oms.order.entity")
-            .persistenceUnit("primary")
-            .build();
-    }
-
-    @Primary
-    @Bean
-    public PlatformTransactionManager primaryTransactionManager(
-            @Qualifier("primaryEntityManagerFactory") EntityManagerFactory emf) {
-        return new JpaTransactionManager(emf);
-    }
+@Document(collection = "order_events")
+public class OrderEvent {
+    @Id
+    private String id;                    // MongoDB ObjectId
+    private Long orderId;                 // reference to JPA Order.id
+    private Long customerId;              // denormalized for querying
+    private OrderEventType eventType;     // CREATED, STATUS_CHANGED, CANCELLED
+    private String description;           // human-readable
+    private OrderSnapshot orderSnapshot;  // embedded snapshot of order state at event time
+    private Map<String, Object> metadata; // flexible extra data per event type
+    private Instant timestamp;            // when the event occurred
 }
 ```
 
-- Repeat for `ReportingDataSourceConfig` (package: `com.oms.reporting`) and `LegacyDataSourceConfig` (package: `com.oms.legacy`).
+Key document patterns demonstrated:
+- **Embedded documents:** `OrderSnapshot` contains nested `List<OrderItemSnapshot>` — no JOINs needed.
+- **Flexible schema:** `metadata` map allows each event type to carry different data without schema changes.
+- **Indexed fields:** `orderId` and `timestamp` indexed for efficient querying.
 
-#### Step 3: Package structure
+### 2.3 Multi-DataSource Configuration
+
+Spring Boot auto-configures JPA and MongoDB separately when both starters are on the classpath.
+
+**JPA:** Keep auto-configured (existing setup unchanged). The `@Primary` DataSource, EntityManagerFactory, and TransactionManager are all auto-created.
+
+**MongoDB:** Add `spring-boot-starter-data-mongodb`. Auto-configuration creates `MongoClient`, `MongoTemplate`, and scans for `MongoRepository` beans.
+
+```yaml
+# application.yml additions
+spring:
+  data:
+    mongodb:
+      database: oms_events
+
+# application-dev.yml additions
+spring:
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/oms_events
+
+# application-prod.yml additions
+spring:
+  data:
+    mongodb:
+      uri: mongodb://${MONGO_HOST:localhost}:${MONGO_PORT:27017}/oms_events
+```
+
+**MongoDB auditing:** Create `MongoConfig` with `@EnableMongoAuditing` (parallel to existing `JpaAuditingConfig`).
+
+#### Package structure
+
+MongoDB domain lives in a separate `com.oms.mongo` package. Existing JPA code stays untouched.
 
 ```
 com.oms
-├── order/                    ← primary datasource
-│   ├── entity/    (Order, Customer, Product)
-│   ├── repository/
-│   └── service/
-├── reporting/                ← reporting datasource (read-only)
-│   ├── entity/    (SalesReport, DashboardMetric)
-│   ├── repository/
-│   └── service/
-└── legacy/                   ← legacy MySQL datasource
-    ├── entity/    (WarehouseStock)
-    ├── repository/
-    └── service/
+├── config/
+│   ├── JpaAuditingConfig.java          (existing, unchanged)
+│   ├── OrderProperties.java            (existing, unchanged)
+│   └── MongoConfig.java                (NEW — @EnableMongoAuditing)
+├── mongo/                              (NEW — all MongoDB domain code)
+│   ├── document/
+│   │   ├── OrderEvent.java             (@Document)
+│   │   ├── OrderSnapshot.java          (embedded record)
+│   │   ├── OrderItemSnapshot.java      (embedded record)
+│   │   └── OrderEventType.java         (enum)
+│   └── repository/
+│       └── OrderEventRepository.java   (MongoRepository)
+├── service/
+│   ├── OrderService.java               (MODIFIED — cross-DB event publishing)
+│   ├── OrderEventService.java          (NEW — MongoDB CRUD)
+│   └── ...existing services unchanged
+├── controller/
+│   ├── OrderEventController.java       (NEW — event query endpoints)
+│   └── ...existing controllers unchanged
+└── ...existing packages unchanged
 ```
 
-### 2.3 Scenarios to Implement
+### 2.4 Scenarios to Implement
 
-#### Scenario A: Cross-Database Order Placement
+#### Scenario A: Cross-Database Order Event Publishing
 
-**What:** Customer places an order → write to primary DB → check stock in legacy MySQL → decrement stock.
-**Challenge:** Two different databases, two different transaction managers — you CANNOT use `@Transactional` across both.
+**What:** Customer places an order → write Order to JPA → write OrderEvent to MongoDB.
+**Challenge:** Two different databases, two different persistence mechanisms — `@Transactional` only covers JPA.
+**Pattern:** JPA is the source of truth. MongoDB event write is best-effort with compensating transaction.
+
+```java
+@Transactional
+public OrderResponse createOrder(OrderRequest request) {
+    // ... existing JPA logic ...
+    Order saved = orderRepository.save(order);
+
+    // After JPA write, publish event to MongoDB (outside JPA transaction)
+    try {
+        orderEventService.recordOrderCreated(saved);
+    } catch (Exception e) {
+        // MongoDB write failed — log for retry/reconciliation
+        // Do NOT roll back the JPA order
+        log.error("Failed to record event for order {}: {}", saved.getId(), e.getMessage());
+    }
+
+    return orderMapper.toResponse(saved);
+}
+```
+
 **Practice:**
-- Implement a service that coordinates both calls.
-- Handle the case where order is saved but stock decrement fails (compensating transaction / saga pattern).
-- Log warnings when the legacy system is slow or unreachable.
+- Implement cross-DB coordination in `OrderService.createOrder()` and `updateOrderStatus()`.
+- Handle the case where MongoDB is unreachable (order still succeeds, event is logged for retry).
+- Understand why `@Transactional` cannot span both databases.
 
-#### Scenario B: Read-Replica / Reporting Queries
+#### Scenario B: Dynamic DataSource Routing (JPA Read/Write)
 
-**What:** Admin dashboard queries aggregated sales data from the reporting DB, NOT the primary OLTP DB.
-**Why separate:** Reporting queries are heavy (GROUP BY, window functions) — running them on the primary DB would degrade order-processing performance.
-**Practice:**
-- `SalesReportRepository` reads from the reporting data source.
-- Ensure the reporting data source is configured as **read-only** (`spring.jpa.properties.hibernate.connection.readOnly=true`).
-- The reporting DB is populated by a cron job or Kafka consumer (from Phase 4).
-
-#### Scenario C: Dynamic DataSource Routing
-
-**What:** Route reads to a read-replica and writes to the primary, transparently.
+**What:** Route JPA reads to a read-replica and writes to the primary, transparently.
 **Practice:**
 - Implement `AbstractRoutingDataSource` with a `ThreadLocal` to hold the current datasource key.
 - Create a custom `@ReadOnly` annotation that sets the routing context.
@@ -193,133 +200,118 @@ public class RoutingDataSource extends AbstractRoutingDataSource {
 public List<Order> getRecentOrders() { ... }
 ```
 
-#### Scenario D: Schema Migration per Data Source
+- Activated via `@ConditionalOnProperty("oms.routing.enabled")` — off by default for dev.
+- In dev, both primary and replica point to the same PostgreSQL (routing mechanism still works, but disabled by default via `oms.routing.enabled=false`).
+- In prod, replica points to a PostgreSQL read replica (`oms.routing.enabled=true`).
 
-**What:** Manage Flyway/Liquibase migrations independently for each database.
+#### Scenario C: Schema Migration with Flyway
+
+**What:** Manage JPA database schema changes with Flyway instead of `ddl-auto`.
 **Practice:**
-- Configure separate `Flyway` beans, each pointing to its own data source and migration folder.
-- Migration folders: `db/migration/primary/`, `db/migration/reporting/`, `db/migration/legacy/`.
-- Handle the case where the legacy DB has an existing schema you cannot modify (use `baselineOnMigrate`).
+- Create Flyway migration scripts for the existing Customer, Product, Order, OrderItem tables.
+- Use `BIGSERIAL` for auto-incrementing IDs (pure PostgreSQL — no H2 compatibility needed since dev uses PostgreSQL via Docker).
+- Replace `ddl-auto: create-drop` (dev) with `ddl-auto: validate` + Flyway.
+- MongoDB does not need schema migrations — indexes are declared via `@Indexed` annotations.
 
-```java
-@Bean
-public Flyway primaryFlyway(@Qualifier("primaryDataSource") DataSource ds) {
-    Flyway flyway = Flyway.configure()
-        .dataSource(ds)
-        .locations("classpath:db/migration/primary")
-        .load();
-    flyway.migrate();
-    return flyway;
-}
+```sql
+-- V1__create_customer_table.sql
+CREATE TABLE customer (
+    id          BIGSERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    email       VARCHAR(255) NOT NULL UNIQUE,
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP
+);
 ```
 
-### 2.4 Transaction Management Across Data Sources
+### 2.5 Transaction Management Across Data Sources
 
-This is the hardest part — understand the tradeoffs:
+Understand the tradeoffs:
 
 | Approach | How | When to Use |
 |----------|-----|-------------|
-| **Separate transactions** | Each DB has its own `@Transactional("txManagerName")` | Default. Accept eventual consistency. |
-| **Compensating transaction** | If step 2 fails, undo step 1 manually | When you can tolerate brief inconsistency but need eventual correction. |
-| **ChainedTransactionManager** | Commits both in sequence (NOT true 2PC) | When "best effort" is acceptable — second commit can still fail. |
+| **Separate transactions** | JPA has `@Transactional`, MongoDB writes are independent | Default. Accept eventual consistency. |
+| **Compensating transaction** | If MongoDB fails after JPA commits, log for retry | When you can tolerate brief inconsistency but need eventual correction. |
+| **`@TransactionalEventListener`** | Publish Spring event in JPA tx, MongoDB write happens after commit | Cleaner separation of concerns, harder to debug. |
 | **JTA / Atomikos** | True distributed transaction (2PC) | Only when you MUST have atomicity. Heavy, slow, avoid if possible. |
 
-**Practice:** Implement Scenario A with both "separate + compensating" and "ChainedTransactionManager" approaches. Compare the tradeoffs.
+**Practice:** Implement Scenario A with "separate + compensating" (try/catch pattern). Discuss when you would choose `@TransactionalEventListener` instead.
 
-### 2.5 Testing Multiple Data Sources
+### 2.6 Testing Multiple Data Sources
 
-#### Integration test with multiple Testcontainers
+#### Slice tests per data source
 
-- Spin up **PostgreSQL + MySQL** containers in the same test.
-- Use `@DynamicPropertySource` to wire each container to the correct config property.
-- Test that entities from different packages route to the correct database.
+- **JPA:** `@DataJpaTest` + Testcontainers `PostgreSQLContainer` + `@AutoConfigureTestDatabase(replace = NONE)` — migrated from H2 to real PostgreSQL so Flyway migrations run identically to dev/prod.
+- **MongoDB:** `@DataMongoTest` with Testcontainers `MongoDBContainer` — tests MongoDB repository methods.
+
+#### Full integration test with Testcontainers
+
+Spin up **PostgreSQL + MongoDB** containers in the same test:
 
 ```java
 @SpringBootTest
 @Testcontainers
 class MultiDataSourceIntegrationTest {
     @Container
-    static PostgreSQLContainer<?> primaryPg =
-        new PostgreSQLContainer<>("postgres:16");
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16");
     @Container
-    static PostgreSQLContainer<?> reportingPg =
-        new PostgreSQLContainer<>("postgres:16");
-    @Container
-    static MySQLContainer<?> legacyMysql =
-        new MySQLContainer<>("mysql:8");
+    static MongoDBContainer mongo = new MongoDBContainer("mongo:7");
 
     @DynamicPropertySource
     static void props(DynamicPropertyRegistry r) {
-        r.add("spring.datasource.primary.url", primaryPg::getJdbcUrl);
-        r.add("spring.datasource.primary.username", primaryPg::getUsername);
-        r.add("spring.datasource.primary.password", primaryPg::getPassword);
-        r.add("spring.datasource.reporting.url", reportingPg::getJdbcUrl);
-        r.add("spring.datasource.reporting.username", reportingPg::getUsername);
-        r.add("spring.datasource.reporting.password", reportingPg::getPassword);
-        r.add("spring.datasource.legacy.url", legacyMysql::getJdbcUrl);
-        r.add("spring.datasource.legacy.username", legacyMysql::getUsername);
-        r.add("spring.datasource.legacy.password", legacyMysql::getPassword);
+        r.add("spring.datasource.url", postgres::getJdbcUrl);
+        r.add("spring.datasource.username", postgres::getUsername);
+        r.add("spring.datasource.password", postgres::getPassword);
+        r.add("spring.data.mongodb.uri", mongo::getReplicaSetUrl);
     }
 
-    @Autowired OrderRepository orderRepo;       // → primary PG
-    @Autowired SalesReportRepository reportRepo; // → reporting PG
-    @Autowired WarehouseStockRepository stockRepo; // → legacy MySQL
+    @Autowired OrderService orderService;
+    @Autowired OrderEventRepository orderEventRepository;
 
     @Test
-    void eachRepository_routesToCorrectDatabase() { ... }
+    void createOrder_writesToBothJpaAndMongoDB() { ... }
 
     @Test
-    void crossDbOrderPlacement_compensatesOnStockFailure() { ... }
+    void updateOrderStatus_recordsEventInMongoDB() { ... }
 }
 ```
 
-#### Test routing data source
-
-- Write to primary, read via `@ReadOnly` annotation, assert it came from the replica.
-- Verify `AbstractRoutingDataSource` switches correctly.
-
-### 2.6 Docker Compose
-
-Add to `docker-compose.yml`:
+### 2.7 Docker Compose
 
 ```yaml
 services:
-  postgres-primary:
+  postgres:
     image: postgres:16
     ports: ["5432:5432"]
     environment:
-      POSTGRES_DB: oms_orders
+      POSTGRES_DB: omsdb
       POSTGRES_USER: oms
-      POSTGRES_PASSWORD: secret
+      POSTGRES_PASSWORD: oms
 
-  postgres-reporting:
+  postgres-replica:
     image: postgres:16
     ports: ["5433:5432"]
     environment:
-      POSTGRES_DB: oms_reporting
-      POSTGRES_USER: oms_readonly
-      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: omsdb
+      POSTGRES_USER: oms
+      POSTGRES_PASSWORD: oms
 
-  mysql-legacy:
-    image: mysql:8
-    ports: ["3306:3306"]
-    environment:
-      MYSQL_DATABASE: warehouse
-      MYSQL_USER: legacy
-      MYSQL_PASSWORD: secret
-      MYSQL_ROOT_PASSWORD: root
+  mongodb:
+    image: mongo:7
+    ports: ["27017:27017"]
 ```
 
-### 2.7 Deliverables Checklist
+### 2.8 Deliverables Checklist
 
-- [ ] 3 data source configurations (Primary PG, Reporting PG, Legacy MySQL).
-- [ ] Package-scoped `@EnableJpaRepositories` for each data source.
-- [ ] Cross-database order placement with compensating transaction.
-- [ ] Read-only reporting queries from separate DB.
-- [ ] `AbstractRoutingDataSource` with `@ReadOnly` annotation.
-- [ ] Flyway migrations per data source.
-- [ ] Integration tests with PostgreSQL + MySQL Testcontainers.
-- [ ] Docker Compose with all 3 databases.
+- [ ] MongoDB data source configuration alongside existing JPA.
+- [ ] `OrderEvent` document model with embedded snapshots and flexible metadata.
+- [ ] Cross-database order event publishing with compensating transaction pattern.
+- [ ] `OrderEventService` and `OrderEventController` for event CRUD and querying.
+- [ ] `AbstractRoutingDataSource` with custom `@ReadOnly` annotation and AOP aspect.
+- [ ] Flyway schema migrations for JPA tables.
+- [ ] `@DataMongoTest` slice tests with Testcontainers.
+- [ ] Full integration test with PostgreSQL + MongoDB Testcontainers.
+- [ ] Docker Compose with PostgreSQL (primary + replica) and MongoDB.
 
 ---
 

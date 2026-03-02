@@ -16,6 +16,7 @@ import com.oms.repository.OrderRepository;
 import com.oms.repository.OrderSpecification;
 import com.oms.repository.ProductRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.domain.Specification;
@@ -28,12 +29,14 @@ import java.util.List;
 @Service
 @RequiredArgsConstructor
 @Transactional(readOnly = true)
+@Slf4j
 public class OrderService {
 
     private final OrderRepository orderRepository;
     private final CustomerRepository customerRepository;
     private final ProductRepository productRepository;
     private final OrderMapper orderMapper;
+    private final OrderEventService orderEventService;
 
     public PageResponse<OrderResponse> getAllOrders(Pageable pageable) {
         Page<OrderResponse> page = orderRepository.findAll(pageable)
@@ -90,6 +93,14 @@ public class OrderService {
 
         order.setTotalAmount(totalAmount);
         Order saved = orderRepository.save(order);
+
+        // Best-effort MongoDB event — JPA is source of truth
+        try {
+            orderEventService.recordOrderCreated(saved);
+        } catch (Exception e) {
+            log.error("Failed to record CREATED event for order {}: {}", saved.getId(), e.getMessage());
+        }
+
         return orderMapper.toResponse(saved);
     }
 
@@ -97,8 +108,17 @@ public class OrderService {
     public OrderResponse updateOrderStatus(Long id, OrderStatus status) {
         Order order = orderRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Order", id));
+        OrderStatus previousStatus = order.getStatus();
         order.setStatus(status);
         Order saved = orderRepository.save(order);
+
+        // Best-effort MongoDB event — JPA is source of truth
+        try {
+            orderEventService.recordStatusChange(saved, previousStatus, status);
+        } catch (Exception e) {
+            log.error("Failed to record STATUS_CHANGED event for order {}: {}", saved.getId(), e.getMessage());
+        }
+
         return orderMapper.toResponse(saved);
     }
 

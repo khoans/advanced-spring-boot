@@ -8,6 +8,9 @@ spring:
     properties:
       hibernate:
         format_sql: true
+  data:
+    mongodb:
+      database: oms_events
 
 server:
   port: 8080
@@ -16,3 +19,5 @@ oms:
   order:
     max-items-per-order: 50
     default-status: PENDING
+  routing:
+    enabled: false

@@ -66,7 +66,10 @@ class OrderServiceTest {
     @Mock
     private OrderMapper orderMapper;
 
-    // The real service under test — Mockito injects the 4 mocks above into its constructor
+    @Mock
+    private OrderEventService orderEventService;
+
+    // The real service under test — Mockito injects the 5 mocks above into its constructor
     @InjectMocks
     private OrderService orderService;
 
