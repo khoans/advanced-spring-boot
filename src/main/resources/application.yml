@@ -21,3 +21,8 @@ oms:
     default-status: PENDING
   routing:
     enabled: false
+  security:
+    jwt:
+      secret-key: ${JWT_SECRET_KEY:ThisIsASecretKeyForJWTSigningThatShouldBeAtLeast256BitsLongForHS256}
+      expiration-ms: 86400000 # 24 hours
+      refresh-expiration-ms: 604800000 # 7 days
