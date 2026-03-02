@@ -1,0 +1,14 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/omsdb
+    driver-class-name: org.postgresql.Driver
+    username: ${DB_USERNAME:oms}
+    password: ${DB_PASSWORD:oms}
+  jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+  h2:
+    console:
+      enabled: false
